@@ -1072,6 +1072,76 @@ function s_Wyckoff(cs,atr){
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  MISSING HELPER FUNCTIONS — were called but never defined
+// ══════════════════════════════════════════════════════════════════
+
+// isFakeBO — returns true if a breakout at `level` in direction `dir` was recently faked out
+function isFakeBO(fakeLog, level, dir){
+  if(!fakeLog||!fakeLog.length)return false;
+  const tol=2.0; // $2 tolerance for XAU
+  return fakeLog.some(f=>f.dir===dir&&Math.abs(f.level-level)<tol&&Date.now()-f.t<18*60*1000);
+}
+
+// getMTFBias — returns +1 (bullish), -1 (bearish), or 0 (neutral) based on H1 trend
+function getMTFBias(tfCandles){
+  try{
+    const h1=tfCandles&&tfCandles.h1;
+    if(!h1||h1.length<6)return 0;
+    const s=h1.slice(-6);
+    const bullCount=s.filter(c=>c.bull).length;
+    if(bullCount>=5)return 1;   // strongly bullish
+    if(bullCount<=1)return -1;  // strongly bearish
+    // Check EMA-style trend: last close vs first close
+    const first=s[0].close, last=s[s.length-1].close;
+    if(last>first*1.0005)return 1;
+    if(last<first*0.9995)return -1;
+    return 0;
+  }catch(_){return 0;}
+}
+
+// getActiveNewsTrade — returns a news event happening right now that suggests a direction
+function getActiveNewsTrade(newsArr){
+  if(!newsArr||!newsArr.length)return null;
+  const now=Date.now();
+  for(const ev of newsArr){
+    if(!ev||!ev.date||!ev.dir)continue;
+    let evMs=0;
+    try{
+      const direct=Date.parse(ev.date);
+      if(!isNaN(direct)&&direct>0){evMs=direct;}
+      else{
+        const parts=ev.date.split(/[-/]/);
+        if(parts.length>=3){evMs=Date.parse(parts[2]+'-'+parts[0].padStart(2,'0')+'-'+parts[1].padStart(2,'0'));}
+      }
+    }catch{continue;}
+    if(!evMs||isNaN(evMs))continue;
+    const diffMin=(now-evMs)/60000; // positive = event passed
+    // Active window: 0–10 min after event (only after release, not before)
+    if(diffMin>=0&&diffMin<=10&&(ev.impact==="High"||ev.impact==="Medium")){
+      return{dir:ev.dir,impact:ev.impact,title:ev.title};
+    }
+  }
+  return null;
+}
+
+// detectMarketState — returns "TRENDING", "RANGING", or "NORMAL"
+function detectMarketState(cs){
+  try{
+    if(!cs||cs.length<30)return"NORMAL";
+    const s=cs.slice(-30);
+    const atr=calcATR(cs);
+    // Directional move: compare first and last close
+    const move=Math.abs(s[s.length-1].close-s[0].close);
+    const range=Math.max(...s.map(x=>x.high))-Math.min(...s.map(x=>x.low));
+    if(range<0.01)return"NORMAL";
+    const trendRatio=move/range;
+    if(trendRatio>0.60)return"TRENDING"; // price moved >60% of its range directionally
+    if(trendRatio<0.25)return"RANGING";  // price oscillated, net move <25% of range
+    return"NORMAL";
+  }catch(_){return"NORMAL";}
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  MASTER SIGNAL ENGINE — 30 strategies, 5 families
 //  Family diversity gate: ≥2 families must agree to open a trade
 //  SMC/CHoCH dedup: same structural event — only one counts
@@ -1155,32 +1225,37 @@ function masterSignal({cs,hour,kL,spread,orb,news,newsArr,fakeLog,minConf,tfCand
 
   let B=0,S=0;
   const buyFams=new Set(),sellFams=new Set();
+  const buyFamCounts={},sellFamCounts={};
   strategies.forEach(sig=>{
-    if(sig.dir==="BUY"){B++;buyFams.add(sig.fam);}
-    else{S++;sellFams.add(sig.fam);}
+    if(sig.dir==="BUY"){
+      B++;buyFams.add(sig.fam);
+      buyFamCounts[sig.fam]=(buyFamCounts[sig.fam]||0)+1;
+    }else{
+      S++;sellFams.add(sig.fam);
+      sellFamCounts[sig.fam]=(sellFamCounts[sig.fam]||0)+1;
+    }
   });
 
   const activeNewsTrade=getActiveNewsTrade(newsArr||[]);
   if(activeNewsTrade?.dir==="BUY")B+=1;
   else if(activeNewsTrade?.dir==="SELL")S+=1;
 
-  if(B<effectiveMinConf&&S<effectiveMinConf)return null;
   if(B===S)return null;
-
   const rawDir=(B>S)?"BUY":"SELL";
 
-  // Family diversity gate: need ≥2 different families
+  // GATE: fire if ANY single family has >=2 votes in signal direction,
+  // OR total votes meet effectiveMinConf (catches multi-family setups).
+  const activeFamCounts=rawDir==="BUY"?buyFamCounts:sellFamCounts;
   const activeFams=rawDir==="BUY"?buyFams:sellFams;
-  if(activeFams.size<2)return null;
+  const maxFamVotes=Math.max(0,...Object.values(activeFamCounts));
+  const totalVotes=rawDir==="BUY"?B:S;
+  if(maxFamVotes<2&&totalVotes<effectiveMinConf)return null;
 
+  // MTF bias: used for display/confirmation tags only — no longer hard-vetos signals
   const hasMTFData=tfCandles&&tfCandles.h1&&tfCandles.h1.length>=3;
-  if(hasMTFData&&mtfBias!==0){
-    const aligned=(mtfBias>0&&rawDir==="BUY")||(mtfBias<0&&rawDir==="SELL");
-    if(!aligned&&(rawDir==="BUY"?B:S)<effectiveMinConf+1)return null;
-  }
 
   const dir=rawDir;
-  const score=dir==="BUY"?B:S;
+  const score=totalVotes;
   const strengthFloor=40,strengthRange=60;
   const strength=score<=effectiveMinConf
     ?strengthFloor
@@ -1189,7 +1264,9 @@ function masterSignal({cs,hour,kL,spread,orb,news,newsArr,fakeLog,minConf,tfCand
   const confirmTags=strategies.filter(sig=>sig.dir===dir).map(sig=>sig.name);
   if(activeNewsTrade&&activeNewsTrade.dir===dir)confirmTags.push(`${activeNewsTrade.impact.toUpperCase()}-NEWS`);
   if(mtfBias!==0)confirmTags.push(mtfBias>0?"HTF↑":"HTF↓");
-  confirmTags.push(`${activeFams.size}FAM`);
+  // Show dominant family: e.g. "A×3" meaning Family A had 3 votes
+  const topFam=Object.entries(activeFamCounts).sort((a,b)=>b[1]-a[1])[0];
+  if(topFam)confirmTags.push(`${topFam[0]}×${topFam[1]}`);
 
   if(nearRound(c.close,0.5))return null; // only block when price is exactly at a $100 round number (±$0.50)
   const extMult=3.0; // block only if price is very extended (3×ATR beyond prev day high/low)
@@ -2489,12 +2566,10 @@ function App(){
         hourGMT:hour,
       });
 
-      // ── RECOVERY MODE GATE — high-conviction only after 3 losses ──
-      // If in recovery, require score ≥ minConf+2 to ensure only the
-      // best setups trade while rebuilding the account.
-      if(inRecovery && sig.score < rMinConf.current+2){
+      // Recovery mode: prefer higher-conviction signals but don't hard-block
+      if(inRecovery && sig.score < rMinConf.current+1){
         setPhase("SCANNING");
-        setStatus(`🔄 Recovery mode · waiting for ${rMinConf.current+2}+ votes (got ${sig.score}) · rebuilding`);
+        setStatus(`🔄 Recovery · waiting for ${rMinConf.current+1}+ votes (got ${sig.score}) · rebuilding`);
         if(rMode.current!=="forward")setCandles([...newC]);
         return;
       }
@@ -3022,6 +3097,56 @@ function App(){
           setTrade2({...rTrade2.current});
         }else{
           setTrade2({...rTrade2.current});
+        }
+      }
+
+      // ── TICK-LEVEL SIGNAL SCAN — fires when no trade open ─────────
+      // Checks signal every 5 ticks so the bot doesn't wait a full minute
+      // between candle closes. Uses rLiveCandles (closed+forming) for context.
+      if(rRunning.current&&!rTrade.current&&rTickN.current%5===0&&rLiveCandles.current.length>=10){
+        const cs_tick=rLiveCandles.current.slice(-200);
+        const hour_tick=new Date().getUTCHours()+(new Date().getUTCMinutes()/60);
+        const atr_tick=rCachedATR.current||calcATR(cs_tick);
+        const spread_tick=rSpread.current||0.30;
+        const mState_tick=rMktState.current||"NORMAL";
+        const dayLoss_tick=(rBalance.current-rDayStart.current)<-(rDayStart.current*(rMaxLoss.current||10)/100);
+        const timeSince_tick=rLastTradeTs.current===0?Infinity:Date.now()-rLastTradeTs.current;
+        if(!dayLoss_tick&&!isNewsBlackout(rNews.current)&&timeSince_tick>300000||rLastTradeTs.current===0){
+          const sig_tick=masterSignal({
+            cs:cs_tick,hour:hour_tick,kL:rKLevels.current,spread:spread_tick,
+            orb:rOrb.current,news:rActiveNews.current,newsArr:rNews.current,
+            fakeLog:rFakeLog.current,minConf:rMinConf.current,
+            tfCandles:rTfCandles.current,inst:rInstrument.current,mktState:mState_tick,
+          });
+          if(sig_tick&&sig_tick.strength>=40){
+            const realSL_t=calcHFTSL({cs:cs_tick,dir:sig_tick.dir,entry:sig_tick.entry,
+              atr:atr_tick,spread:spread_tick,hourGMT:hour_tick,
+              balance:rBalance.current,inst:rInstrument.current});
+            const{lots:rawL_t,riskDollars:rd_t,riskPct:rp_t}=calcHFTLots({
+              balance:rBalance.current,dayStartBal:rDayStart.current,
+              startBalance:rStartBal.current,strength:sig_tick.strength,
+              score:sig_tick.score,slD:realSL_t.slD,inst:rInstrument.current,
+              streak:rStreak.current,livePrice:price,hourGMT:hour_tick,
+            });
+            const lots_t=+Math.min(Math.max(rawL_t,MIN_LOT),MAX_LOT_NORMAL).toFixed(4);
+            const initTD=+(atr_tick*2.0).toFixed(2);
+            const initSL_t=sig_tick.dir==="BUY"?+(sig_tick.entry-initTD).toFixed(2):+(sig_tick.entry+initTD).toFixed(2);
+            const t_tick={...sig_tick,sl:initSL_t,slD:initTD,
+              tp1:+(sig_tick.dir==="BUY"?sig_tick.entry+realSL_t.slD*1.5:sig_tick.entry-realSL_t.slD*1.5).toFixed(2),
+              tp2:+(sig_tick.dir==="BUY"?sig_tick.entry+realSL_t.slD*3.0:sig_tick.entry-realSL_t.slD*3.0).toFixed(2),
+              tp3:+(sig_tick.dir==="BUY"?sig_tick.entry+realSL_t.slD*6.0:sig_tick.entry-realSL_t.slD*6.0).toFixed(2),
+              lots:lots_t,pnl:0,p1Done:false,p2Done:false,p3Done:false,
+              trailing:true,beDone:true,posNum:1,inst:rInstrument.current,
+              highWater:sig_tick.entry,lowWater:sig_tick.entry,tradeMode:"TICK"};
+            rTrade.current=t_tick;
+            rDayTrades.current+=1;setDayTrades(rDayTrades.current);
+            setTrade(t_tick);setPhase("IN_TRADE");
+            setStatus(`🔥 ${sig_tick.dir} @ ${sig_tick.entry} · ${sig_tick.confirms} · ${sig_tick.strength}%`);
+            rLog.current=[{won:null,result:"OPEN",dir:sig_tick.dir,strength:sig_tick.strength,
+              confirms:sig_tick.confirms,entry:sig_tick.entry,exitP:"—",pnl:0,
+              time:new Date().toLocaleTimeString(),ts:Date.now()},...rLog.current].slice(0,500);
+            setLog([...rLog.current]);
+          }
         }
       }
 
